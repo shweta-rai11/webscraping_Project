@@ -6,6 +6,7 @@ import pandas as pd
 from Bio import Entrez
 from bs4 import BeautifulSoup
 
+#https://biopython.org/docs/1.76/api/Bio.Entrez.html - reference taken for using entrez, esearch and efetch.
 def search_geo_accessions(keyword, retmax=1000, retstart=0):
     Entrez.email = "swetaraibms@gmail.com"  
     search_results = []
