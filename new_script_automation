@@ -1,0 +1,166 @@
+import os
+import re
+import time
+import requests
+import pandas as pd
+from Bio import Entrez
+from bs4 import BeautifulSoup
+from concurrent.futures import ThreadPoolExecutor
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+
+# Email for Entrez
+Entrez.email = "swetaraibms@gmail.com"
+
+def sanitize_keyword(keyword):
+    return re.sub(r'[^A-Za-z0-9_]', '_', keyword.strip())
+
+def search_geo_accessions(keyword, retmax=10, retstart=0):
+    logging.info(f"Searching GEO Accession Numbers for keyword: {keyword}, RetMax: {retmax}, RetStart: {retstart}")
+    handle = Entrez.esearch(db="gds", term=keyword, retmax=retmax, retstart=retstart)
+    record = Entrez.read(handle)
+    handle.close()
+    return record.get("IdList", []), int(record.get("Count", 0))
+
+def fetch_geo_accession_details(id_list):
+    logging.info(f"Fetching details for GEO accessions: {id_list}")
+    accession_numbers = set()
+    if id_list:
+        handle = Entrez.efetch(db="gds", id=id_list, rettype="full", retmode="text")
+        data = handle.read()
+        handle.close()
+        found_accessions = re.findall(r"GSE\d{6,7}", data)
+        accession_numbers.update(found_accessions)
+    return list(accession_numbers)
+
+def fetch_all_geo_accessions(keyword, max_results=100):
+    all_accessions = set()
+    retstart = 0
+    while True:
+        geo_ids, total_count = search_geo_accessions(keyword, retmax=max_results, retstart=retstart)
+        if not geo_ids:
+            break
+        logging.info(f"Found {len(geo_ids)} GEO IDs. Total: {total_count}")
+        accessions = fetch_geo_accession_details(geo_ids)
+        all_accessions.update(accessions)
+        retstart += max_results
+        if retstart >= total_count:
+            break
+    return list(all_accessions)
+
+def save_accessions_to_sheet(accessions, directory, keyword):
+    filename = f"geo_accessions_{keyword}.xlsx"
+    file_path = os.path.join(directory, filename)
+    pd.DataFrame(accessions, columns=["GEO Accession Number"]).to_excel(file_path, index=False)
+    logging.info(f"Data saved to {file_path}")
+    return file_path
+
+def fetch_pubmed_ids_from_geo(accession_list):
+    base_url = "https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi"
+
+    def fetch_pubmed_data(accession):
+        logging.info(f"Fetching PubMed IDs for GEO Accession: {accession}")
+        url = f"{base_url}?acc={accession}&view=full"
+        response = requests.get(url)
+        soup = BeautifulSoup(response.text, 'html.parser')
+        pubmed_ids = [a['href'].split('=')[-1] for a in soup.find_all('a', href=True) if 'pubmed' in a['href']]
+        return {'accession': accession, 'Pubmed_ID': ', '.join(pubmed_ids)}
+
+    with ThreadPoolExecutor() as executor:
+        metadata = list(executor.map(fetch_pubmed_data, accession_list))
+    return metadata
+
+def fetch_pubmed_html(pubmed_id):
+    url = f'https://pubmed.ncbi.nlm.nih.gov/{pubmed_id}/'
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        return response.text
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Error fetching PubMed ID {pubmed_id}: {e}")
+        return None
+
+def search_nct_in_abstract(html):
+    soup = BeautifulSoup(html, 'html.parser')
+    abstract_div = soup.find('div', class_='abstract-content selected')
+    if abstract_div:
+        abstract_text = abstract_div.get_text()
+        nct_match = re.search(r'NCT\d+', abstract_text)
+        if nct_match:
+            return nct_match.group(0)
+
+    trial_reg_div = soup.find('div', class_='trial-registration')
+    if trial_reg_div:
+        trial_reg_text = trial_reg_div.get_text()
+        nct_match = re.search(r'NCT\d+', trial_reg_text)
+        if nct_match:
+            return nct_match.group(0)
+
+    return None
+
+def process_pubmed_ids(input_file, output_file):
+    df = pd.read_excel(input_file).dropna(subset=['Pubmed_ID'])
+
+    # Extract PubMed IDs from strings like /pubmed/33676427
+    def extract_pubmed_ids(text):
+        return re.findall(r'/pubmed/(\d+)', str(text))
+
+    # Flatten list of IDs and keep them unique
+    pubmed_ids = set()
+    for entry in df['Pubmed_ID']:
+        pubmed_ids.update(extract_pubmed_ids(entry))
+
+    results = []
+
+    for i, pubmed_id in enumerate(pubmed_ids, start=1):
+        print(f"Processing {i}/{len(pubmed_ids)}: PubMed ID {pubmed_id}")
+        html = fetch_pubmed_html(pubmed_id)
+        if html:
+            nct_number = search_nct_in_abstract(html)
+            if nct_number:
+                results.append({'Pubmed_ID': pubmed_id, 'NCT Number': nct_number})
+                print(f"  Found NCT Number: {nct_number}")
+            else:
+                results.append({'Pubmed_ID': pubmed_id, 'NCT Number': 'NCT Not Found'})
+                print(f"  No NCT Number found.")
+        else:
+            results.append({'Pubmed_ID': pubmed_id, 'NCT Number': 'NCT Not Found'})
+            print(f"  Failed to fetch data for PubMed ID {pubmed_id}.")
+        time.sleep(1)
+
+    res1 = pd.DataFrame(results)
+    res1.to_excel(output_file, index=False)
+    print(f"Processed NCT numbers saved to {output_file}")
+
+def filter_nct(input_file, output_file):
+    data = pd.read_excel(input_file)
+    match_data = data[data['NCT Number'].str.match(r'^NCT\d+$', na=False)]
+    match_data.to_excel(output_file, index=False)
+    print(f"Filtered data with valid NCT numbers saved to {output_file}")
+
+# Main script
+if __name__ == "__main__":
+    dir = '/Users/swetarai/Downloads'
+    raw_keyword = input("Enter keyword for GEO search: ")
+    keyword = sanitize_keyword(raw_keyword)
+
+    # Step 1: Fetch GEO Accessions
+    geo_accessions = fetch_all_geo_accessions(raw_keyword)
+    accessions_file = save_accessions_to_sheet(geo_accessions, dir, keyword)
+
+    # Step 2: Fetch PubMed IDs for GEO accessions
+    geo_df = pd.read_excel(accessions_file)
+    geo_accessions = geo_df['GEO Accession Number'].tolist()
+    geo_metadata = fetch_pubmed_ids_from_geo(geo_accessions)
+    metadata_file = os.path.join(dir, f"geo_pubmed_metadata_{keyword}.xlsx")
+    pd.DataFrame(geo_metadata).to_excel(metadata_file, index=False)
+
+    # Step 3: Process PubMed IDs and extract NCT numbers
+    cleaned_file_data = os.path.join(dir, f"cleaned_geo_pubmed_metadata_{keyword}.xlsx")
+    process_pubmed_ids(metadata_file, cleaned_file_data)
+
+    # Step 4: Filter valid NCT numbers
+    final_output_file = os.path.join(dir, f"output_with_valid_nct_{keyword}.xlsx")
+    filter_nct(cleaned_file_data, final_output_file)
